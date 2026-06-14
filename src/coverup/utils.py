@@ -85,6 +85,12 @@ async def subprocess_run(args: T.Sequence[str], check: bool = False, timeout: T.
 def summary_coverage(cov: dict, sources: T.List[Path]) -> str:
     """Returns the summary coverage, limiting it to the source files if any are given."""
 
+    return f"{coverage_percent(cov, sources):.1f}%"
+
+
+def coverage_percent(cov: dict, sources: T.List[Path]) -> float:
+    """Returns the numeric summary coverage, limiting it to the source files if any are given."""
+
     if sources:
         import copy
         from slipcover.slipcover import add_summaries
@@ -102,4 +108,4 @@ def summary_coverage(cov: dict, sources: T.List[Path]) -> str:
         add_summaries(filtered)
         cov = filtered
 
-    return f"{cov['summary']['percent_covered']:.1f}%"
+    return cov['summary']['percent_covered']

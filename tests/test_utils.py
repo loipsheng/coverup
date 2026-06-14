@@ -248,8 +248,10 @@ def test_summary_coverage():
 }""")
 
     assert utils.summary_coverage(cov, []) == '22.7%'
+    assert round(utils.coverage_percent(cov, []), 1) == 22.7
 
     assert utils.summary_coverage(cov, [Path("src/coverup/prompt.py").resolve()]) == '41.3%'
+    assert round(utils.coverage_percent(cov, [Path("src/coverup/prompt.py").resolve()]), 1) == 41.3
 
     assert utils.summary_coverage(cov, [Path("src/coverup/prompt.py").resolve(),
                                         Path("src/coverup/pytest_plugin.py").resolve()]) == '25.0%'

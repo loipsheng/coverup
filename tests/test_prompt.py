@@ -6,6 +6,7 @@ from coverup.prompt.gpt_v1 import GptV1Prompter
 from coverup.prompt.gpt_v2_ablated import GptV2Prompter, GptV2AblatedPrompter
 from coverup.prompt.gpt_v2_fully_ablated import GptV2FullyAblatedPrompter
 from coverup.prompt.claude import ClaudePrompter
+from coverup.prompt.zh_gpt_v2 import ZhGptV2Prompter
 from coverup.coverup import parse_args
 import coverup.codeinfo
 
@@ -95,6 +96,25 @@ def test_ablated_nothing_ablated(pkg_fixture):
     assert v2.missing_coverage_prompt(s, {1,2,3}, set()) == ablated.missing_coverage_prompt(s, {1,2,3}, set())
 
     assert "get_info name='foo' generate_imports=True" in ablated.get_info(s, "foo")
+
+
+def test_zh_gpt_v2_prompt(pkg_fixture):
+    args = parse_args(["--package", "lib/ansible", "--tests", "tests", "--model", "gpt-4o",
+                       "--prompt", "zh-gpt-v2"])
+
+    s = MockSegment()
+    p = ZhGptV2Prompter(args)
+
+    initial = p.initial_prompt(s)[0]["content"]
+    assert "你是一个 Python 测试工程师" in initial
+    assert "请根据下面未覆盖的代码，为其生成 pytest 单元测试" in initial
+    assert "使用 assert" in initial
+    assert "不要输出解释" in initial
+
+    repair = p.error_prompt(s, "boom")[0]["content"]
+    assert "上一次生成的测试运行失败" in repair
+    assert "请修复该 pytest 测试代码" in repair
+    assert "boom" in repair
 
 def test_ablated_everything_ablated(pkg_fixture):
     args = parse_args(["--package", "lib/ansible", "--tests", "tests", "--model", "gpt-4o"])

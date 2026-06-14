@@ -12,10 +12,10 @@ from datetime import datetime
 
 from . import llm
 from .segment import *
-from .prompt.prompter import Prompter
+from .prompt.prompter import Prompter, mk_message
 from .testrunner import *
 from .version import __version__
-from .utils import summary_coverage
+from .utils import coverage_percent, summary_coverage
 
 
 def get_prompters() -> dict[str, T.Callable[[T.Any], Prompter]]:
@@ -25,10 +25,12 @@ def get_prompters() -> dict[str, T.Callable[[T.Any], Prompter]]:
     from .prompt.gpt_v2 import GptV2Prompter
     from .prompt.gpt_v2_ablated import GptV2AblatedPrompter
     from .prompt.claude import ClaudePrompter
+    from .prompt.zh_gpt_v2 import ZhGptV2Prompter
 
     return {
         "gpt-v1": GptV1Prompter,
         "gpt-v2": GptV2Prompter,
+        "zh-gpt-v2": ZhGptV2Prompter,
         "gpt-v2-no-coverage": lambda cmd_args: GptV2AblatedPrompter(cmd_args, with_coverage=False),
         "gpt-v2-no-code-context": lambda cmd_args: GptV2AblatedPrompter(cmd_args, with_get_info=False, with_imports=False),
         "gpt-v2-no-error-fixing": lambda cmd_args: GptV2AblatedPrompter(cmd_args, with_error_fixing=False),
@@ -124,6 +126,9 @@ def parse_args(args=None):
     ap.add_argument('--prefix', type=str, default='coverup',
                     help='prefix to use for test file names')
 
+    ap.add_argument('--project-name', type=str,
+                    help='project name to show in generated coverage reports')
+
     ap.add_argument('--write-requirements-to', type=Path,
                     help='append the name of any missing modules to the given file')
 
@@ -170,6 +175,20 @@ def parse_args(args=None):
     ap.add_argument('--save-coverage-to', type=Path_dir,
                     help='save each new test\'s coverage to given directory')
 
+    ap.add_argument('--summary-report', type=Path,
+                    help='write a Chinese Markdown summary report with coverage changes and generation statistics')
+
+    ap.add_argument('--repair-failures-once', default=False,
+                    action=argparse.BooleanOptionalAction,
+                    help='after a generated test fails, ask the LLM to repair it only once for that code segment')
+
+    ap.add_argument('--enforce-test-quality', default=False,
+                    action=argparse.BooleanOptionalAction,
+                    help='use AST checks to reject generated tests with no test functions, too few assertions, or pytest.main calls')
+
+    ap.add_argument('--min-assertions', type=positive_int, default=1,
+                    help='minimum number of assertions required when --enforce-test-quality is enabled')
+
     ap.add_argument('--version', action='version',
                     version=f"%(prog)s v{__version__} (Python {'.'.join(map(str, sys.version_info[:3]))})")
 
@@ -211,6 +230,12 @@ def parse_args(args=None):
         args.src_base_dir = args.source_files[0].parent
     else:
         ap.error('Specify either --package-dir or a file name')
+
+    if not args.project_name:
+        if args.package_dir:
+            args.project_name = args.package_dir.name
+        elif args.source_files:
+            args.project_name = args.src_base_dir.name
 
     return args
 
@@ -521,6 +546,241 @@ def extract_python(response: str) -> str:
 
 state: State
 
+
+def generated_test_files(args: argparse.Namespace) -> T.List[Path]:
+    """Returns generated test files matching CoverUp's current filename prefix."""
+
+    return sorted(args.tests_dir.glob(f"test_{args.prefix}_*.py"))
+
+
+def count_test_functions(test_files: T.Iterable[Path]) -> int:
+    """Counts pytest-style test functions in generated test files."""
+
+    total = 0
+    for test_file in test_files:
+        try:
+            quality = analyze_test_quality(test_file.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError):
+            continue
+
+        total += quality["test_functions"]
+
+    return total
+
+
+def count_assertions(test_files: T.Iterable[Path]) -> int:
+    """Counts assertion-like checks in generated test files."""
+
+    total = 0
+    for test_file in test_files:
+        try:
+            quality = analyze_test_quality(test_file.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError):
+            continue
+
+        total += quality["assertions"]
+
+    return total
+
+
+def analyze_test_quality(test_code: str) -> dict:
+    """Returns lightweight AST quality metrics for generated pytest code."""
+
+    import ast
+
+    try:
+        tree = ast.parse(test_code)
+    except SyntaxError as e:
+        return {
+            "syntax_error": str(e),
+            "test_functions": 0,
+            "assertions": 0,
+            "pytest_main_calls": 0,
+        }
+
+    def is_pytest_raises(node: ast.AST) -> bool:
+        return (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "raises"
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == "pytest"
+        )
+
+    def is_assert_method(node: ast.AST) -> bool:
+        return (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr.startswith("assert")
+        )
+
+    def is_pytest_main(node: ast.AST) -> bool:
+        return (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "main"
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == "pytest"
+        )
+
+    test_functions = 0
+    assertions = 0
+    pytest_main_calls = 0
+
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name.startswith("test_"):
+            test_functions += 1
+        if isinstance(node, ast.Assert) or is_pytest_raises(node) or is_assert_method(node):
+            assertions += 1
+        if is_pytest_main(node):
+            pytest_main_calls += 1
+
+    return {
+        "syntax_error": None,
+        "test_functions": test_functions,
+        "assertions": assertions,
+        "pytest_main_calls": pytest_main_calls,
+    }
+
+
+def test_quality_issues(quality: dict, min_assertions: int) -> T.List[str]:
+    """Returns human-readable quality issues found in generated test code."""
+
+    issues = []
+    if quality["syntax_error"]:
+        issues.append(f"代码存在语法错误：{quality['syntax_error']}")
+    if quality["test_functions"] == 0:
+        issues.append("没有检测到以 test_ 开头的 pytest 测试函数")
+    if quality["assertions"] < min_assertions:
+        issues.append(f"断言数量不足：当前 {quality['assertions']} 个，至少需要 {min_assertions} 个")
+    if quality["pytest_main_calls"]:
+        issues.append("测试代码中包含 pytest.main() 调用，生成测试文件中不应主动启动 pytest")
+    return issues
+
+
+def quality_feedback_prompt(issues: T.List[str], quality: dict) -> str:
+    """Builds a prompt asking the LLM to repair generated test quality issues."""
+
+    return "\n".join([
+        "上一次生成的 pytest 测试代码未通过静态质量检查。",
+        "",
+        "检测到的问题：",
+        *(f"- {issue}" for issue in issues),
+        "",
+        "当前静态指标：",
+        f"- 测试函数数量：{quality['test_functions']}",
+        f"- 断言数量：{quality['assertions']}",
+        f"- pytest.main 调用数量：{quality['pytest_main_calls']}",
+        "",
+        "请重新生成完整的 pytest 测试代码。要求：",
+        "1. 至少包含一个以 test_ 开头的测试函数；",
+        "2. 使用 assert 或 pytest.raises 验证结果；",
+        "3. 不要调用 pytest.main()；",
+        "4. 不要输出解释，只输出包含在 ```python 代码块中的代码。",
+    ])
+
+
+def infer_project_name(args: argparse.Namespace) -> str:
+    """Infers a readable project name for reports."""
+
+    if getattr(args, "project_name", None):
+        return args.project_name
+    if getattr(args, "package_dir", None):
+        return args.package_dir.name
+    if getattr(args, "src_base_dir", None):
+        return args.src_base_dir.name
+    return "unknown_project"
+
+
+def build_coverage_report_lines(
+    args: argparse.Namespace,
+    initial_coverage: dict,
+    final_coverage: dict,
+    *,
+    status: str = "全部通过"
+) -> T.List[str]:
+    """Builds a structured Chinese coverage report block."""
+
+    initial = coverage_percent(initial_coverage, args.source_files)
+    final = coverage_percent(final_coverage, args.source_files)
+    tests = generated_test_files(args)
+    test_files = ", ".join(str(p) for p in tests) if tests else "无"
+
+    return [
+        "========== Coverage Report ==========",
+        f"项目名称：{infer_project_name(args)}",
+        f"原始覆盖率：{initial:.2f}%",
+        f"生成测试后覆盖率：{final:.2f}%",
+        f"覆盖率提升：{final - initial:.2f}%",
+        f"新增测试文件：{test_files}",
+        f"生成测试数量：{count_test_functions(tests)}",
+        f"生成断言数量：{count_assertions(tests)}",
+        f"运行状态：{status}",
+        "====================================",
+    ]
+
+
+def write_summary_report(args: argparse.Namespace, initial_coverage: dict, final_coverage: dict) -> None:
+    """Writes a Chinese Markdown summary of a CoverUp run."""
+
+    initial = coverage_percent(initial_coverage, args.source_files)
+    final = coverage_percent(final_coverage, args.source_files)
+    generated_tests = generated_test_files(args)
+    counters = getattr(state, "_counters", {k: 0 for k in PROGRESS_COUNTERS})
+    report_path = args.summary_report
+
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    report_path.write_text(
+        "\n".join([
+            "# CoverUp 覆盖率引导测试生成实验摘要",
+            "",
+            f"- 生成时间：{datetime.now().isoformat(timespec='seconds')}",
+            f"- 源码目录：{args.package_dir or args.src_base_dir}",
+            f"- 测试目录：{args.tests_dir}",
+            f"- 使用模型：{args.model}",
+            f"- Prompt 模板：{args.prompt}",
+            f"- 初始覆盖率：{initial:.1f}%",
+            f"- 最终覆盖率：{final:.1f}%",
+            f"- 覆盖率提升：{final - initial:+.1f} 个百分点",
+            f"- 生成测试数量：{count_test_functions(generated_tests)}",
+            f"- 生成断言数量：{count_assertions(generated_tests)}",
+            f"- 运行状态：全部通过",
+            f"- 有效测试数 G：{counters.get('G', 0)}",
+            f"- 失败测试数 F：{counters.get('F', 0)}",
+            f"- 无效测试数 U：{counters.get('U', 0)}",
+            f"- 重试次数 R：{counters.get('R', 0)}",
+            "",
+            "## 新增测试文件",
+            "",
+            *(f"- {p}" for p in generated_tests),
+            *([] if generated_tests else ["- 本次运行未发现匹配的新增测试文件。"]),
+            "",
+            "## 说明",
+            "",
+            "本摘要由课程改进版 CoverUp 自动生成，用于记录覆盖率测量、测试生成结果和实验统计信息。",
+            "",
+            "## 结构化覆盖率报告",
+            "",
+            "```text",
+            *build_coverage_report_lines(args, initial_coverage, final_coverage),
+            "```",
+        ]),
+        encoding="utf-8"
+    )
+
+
+def coverage_delta_lines(args: argparse.Namespace, initial_coverage: dict, final_coverage: dict) -> T.List[str]:
+    """Returns Chinese coverage before/after lines for console and report output."""
+
+    return build_coverage_report_lines(args, initial_coverage, final_coverage)
+
+
+def print_coverage_delta(args: argparse.Namespace, initial_coverage: dict, final_coverage: dict) -> None:
+    """Prints a Chinese coverage before/after report."""
+
+    for line in coverage_delta_lines(args, initial_coverage, final_coverage):
+        print(line)
+
 async def improve_coverage(
     args: argparse.Namespace,
     chatter: llm.Chatter,
@@ -531,6 +791,7 @@ async def improve_coverage(
 
     messages = prompter.initial_prompt(seg)
     attempts = 0
+    failure_repairs = 0
 
     if args.dry_run:
         return True
@@ -554,6 +815,14 @@ async def improve_coverage(
             log_write(args, seg, "No Python code in GPT response, giving up")
             break
 
+        if args.enforce_test_quality:
+            quality = analyze_test_quality(last_test)
+            if issues := test_quality_issues(quality, args.min_assertions):
+                state.inc_counter('U')
+                log_write(args, seg, "Generated test failed static quality checks:\n" + "\n".join(issues))
+                messages.append(mk_message(quality_feedback_prompt(issues, quality)))
+                continue
+
         if missing := missing_imports(find_imports(last_test)):
             log_write(args, seg, f"Missing modules {' '.join(missing)}")
             if not args.install_missing_modules or not install_missing_imports(args, seg, missing):
@@ -576,10 +845,15 @@ async def improve_coverage(
         except subprocess.CalledProcessError as e:
             state.inc_counter('F')
             error = clean_error(str(e.stdout, 'UTF-8', errors='ignore'))
+            if args.repair_failures_once and failure_repairs >= 1:
+                log_write(args, seg, "Generated test failed after one repair attempt:\n\n" + error)
+                break
+
             if not (prompts := prompter.error_prompt(seg, error)):
                 log_write(args, seg, "Test failed:\n\n" + error)
                 break
 
+            failure_repairs += 1
             messages.extend(prompts)
             continue
 
@@ -704,6 +978,11 @@ def main():
                 return 1
 
         print(summary_coverage(coverage, args.source_files))
+        print_coverage_delta(args, state.get_initial_coverage(), coverage)
+
+        if args.summary_report:
+            write_summary_report(args, state.get_initial_coverage(), coverage)
+            print(f"Wrote summary report to {args.summary_report}")
         # TODO also show running coverage estimate
 
         chatter.set_add_cost(state.add_cost)
